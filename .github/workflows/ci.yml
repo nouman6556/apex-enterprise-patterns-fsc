@@ -1,0 +1,67 @@
+name: Salesforce CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 'lts/*'
+      - name: Install Salesforce CLI + Code Analyzer
+        run: |
+          npm install -g @salesforce/cli
+          sf plugins install code-analyzer
+      - name: Run Code Analyzer (PMD, ESLint)
+        run: sf code-analyzer run --workspace force-app --severity-threshold 1 --output-file analyzer-results.html
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: code-analyzer-report
+          path: analyzer-results.html
+          if-no-files-found: ignore
+
+  validate-and-test:
+    needs: static-analysis
+    runs-on: ubuntu-latest
+    # Requires repo secrets: SF_CONSUMER_KEY, SF_JWT_KEY, SF_DEVHUB_USERNAME
+    env:
+      HAS_DEVHUB: ${{ secrets.SF_CONSUMER_KEY != '' }}
+    steps:
+      - name: Skip when Dev Hub secrets are not configured
+        if: env.HAS_DEVHUB != 'true'
+        run: echo "Dev Hub secrets not set - skipping scratch org validation."
+      - uses: actions/checkout@v5
+        if: env.HAS_DEVHUB == 'true'
+      - uses: actions/setup-node@v5
+        if: env.HAS_DEVHUB == 'true'
+        with:
+          node-version: 'lts/*'
+      - run: npm install -g @salesforce/cli
+        if: env.HAS_DEVHUB == 'true'
+      - name: Authenticate Dev Hub (JWT)
+        if: env.HAS_DEVHUB == 'true'
+        run: |
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          sf org login jwt --client-id ${{ secrets.SF_CONSUMER_KEY }} --jwt-key-file server.key \
+            --username ${{ secrets.SF_DEVHUB_USERNAME }} --set-default-dev-hub --alias devhub
+          rm server.key
+      - name: Create scratch org
+        if: env.HAS_DEVHUB == 'true'
+        run: sf org create scratch --definition-file config/project-scratch-def.json --alias ci --set-default --duration-days 1 --wait 15
+      - name: Deploy source
+        if: env.HAS_DEVHUB == 'true'
+        run: sf project deploy start --source-dir force-app --wait 20
+      - name: Run Apex tests
+        if: env.HAS_DEVHUB == 'true'
+        run: sf apex run test --test-level RunLocalTests --code-coverage --result-format human --wait 20
+      - name: Delete scratch org
+        if: always() && env.HAS_DEVHUB == 'true'
+        run: sf org delete scratch --target-org ci --no-prompt
